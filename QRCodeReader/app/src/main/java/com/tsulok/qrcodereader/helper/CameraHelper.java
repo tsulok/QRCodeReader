@@ -29,6 +29,10 @@ import android.view.TextureView;
 import com.tsulok.qrcodereader.App;
 import com.tsulok.qrcodereader.utils.AutoFitTextureView;
 
+import net.sourceforge.zbar.Config;
+import net.sourceforge.zbar.ImageScanner;
+
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -47,6 +51,11 @@ public class CameraHelper {
     private AutoFitTextureView hostTextureView;
 
     /**
+     * QR Reader variables
+     */
+    private ImageScanner imageScanner;
+
+    /**
      * Listeners
      */
     private MyStateCallback mStateCallback;
@@ -58,6 +67,7 @@ public class CameraHelper {
     private CaptureRequest.Builder previewRequestBuilder;
     private CaptureRequest previewRequest;
     private CameraCaptureSession captureSession;
+    private boolean previousImageParsed = true;
 
     /**
      * A Semaphore to prevent the app from exiting before closing the camera.
@@ -92,6 +102,7 @@ public class CameraHelper {
         this.hostActivity = hostActivity;
         this.mStateCallback = new MyStateCallback();
         this.surfaceTextureListener = new MySurfaceTextureListener();
+        initQrReader();
     }
 
     public void handleOnResume(){
@@ -106,6 +117,15 @@ public class CameraHelper {
     public void handleOnPause(){
         stopBackgroundThread();
         closeCamera();
+    }
+
+    /**
+     * Initialize qr reader
+     */
+    private void initQrReader(){
+        imageScanner = new ImageScanner();
+        imageScanner.setConfig(0, Config.X_DENSITY, 3);
+        imageScanner.setConfig(0, Config.Y_DENSITY, 3);
     }
 
     /**
@@ -137,7 +157,7 @@ public class CameraHelper {
                 // For still image captures, we use the largest available size.
                 Size largest = Collections.max(
                         Arrays.asList(map.getOutputSizes(ImageFormat.JPEG)),
-                        new CameraHelper.CompareSizesByArea());
+                        new CompareSizesByArea());
 //                imageReaderPreviewYUV = ImageReader.newInstance(largest.getWidth(), largest.getHeight(),
 //                        ImageFormat.JPEG, /*maxImages*/2);
 //                imageReaderPreviewYUV.setOnImageAvailableListener(
@@ -344,10 +364,31 @@ public class CameraHelper {
             mBackgroundHandler.post(new Runnable() {
                 @Override
                 public void run() {
-                    // aquire the next JPEG image
-                    Image image = reader.acquireNextImage();
+                    if(previousImageParsed){
+                        previousImageParsed = false;
+                        Image image = reader.acquireNextImage();
 
-                    reader.close();
+                        Log.d(TAG, "Image found");
+
+                        ByteBuffer buffer = image.getPlanes()[0].getBuffer();
+                        byte[] data = new byte[buffer.remaining()];
+                        buffer.get(data);
+
+                        Log.d(TAG, "Buffer read");
+
+                        net.sourceforge.zbar.Image barcode =
+                                new net.sourceforge.zbar.Image(
+                                        reader.getWidth(),
+                                        reader.getHeight(),
+                                        "Y800");
+                        barcode.setData(data);
+                        int result = imageScanner.scanImage(barcode);
+
+                        Log.i(TAG, "Result: " + result);
+
+                        reader.close();
+                        previousImageParsed = true;
+                    }
                 }
             });
         }
@@ -357,9 +398,6 @@ public class CameraHelper {
         @Override
         public void onCaptureStarted(CameraCaptureSession session, CaptureRequest request, long timestamp, long frameNumber) {
             super.onCaptureStarted(session, request, timestamp, frameNumber);
-//            Log.d(TAG, "TimeStamp: " + timestamp);
-//            Log.d(TAG, "FrameNumber: " + frameNumber);
-//            Log.d(TAG, "");
         }
 
         @Override
@@ -367,17 +405,9 @@ public class CameraHelper {
             super.onCaptureProgressed(session, request, partialResult);
         }
 
-        private boolean asd = true;
-
         @Override
         public void onCaptureCompleted(CameraCaptureSession session, CaptureRequest request, TotalCaptureResult result) {
             super.onCaptureCompleted(session, request, result);
-            if(asd){
-                asd = false;
-                for (CaptureResult.Key<?> key : result.getKeys()) {
-                    Log.d(TAG, key.getName());
-                }
-            }
         }
 
         @Override
@@ -418,7 +448,6 @@ public class CameraHelper {
         }
     };
 
-    // private final  mStateCallback = new CameraDevice.StateCallback() {
     /**
      * {@link CameraDevice.StateCallback} is called when {@link CameraDevice} changes its state.
      */
