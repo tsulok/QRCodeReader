@@ -12,7 +12,7 @@ import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
-import android.hardware.camera2.CaptureFailure;
+import android.hardware.camera2.CameraMetadata;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.CaptureResult;
 import android.hardware.camera2.TotalCaptureResult;
@@ -60,6 +60,7 @@ public class CameraHelper {
      */
     private MyStateCallback mStateCallback;
     private MySurfaceTextureListener surfaceTextureListener;
+    private MyCaptureCallback captureCallback;
 
     /**
      * For the camera preview
@@ -68,6 +69,11 @@ public class CameraHelper {
     private CaptureRequest previewRequest;
     private CameraCaptureSession captureSession;
     private boolean previousImageParsed = true;
+
+    /**
+     * The current state of camera state for taking pictures.
+     */
+    private int state = CameraConstants.STATE_PREVIEW;
 
     /**
      * A Semaphore to prevent the app from exiting before closing the camera.
@@ -94,6 +100,7 @@ public class CameraHelper {
     /**
      * An {@link android.media.ImageReader} that handles still image capture.
      */
+    private ImageReader imageReaderJPEG;
     private ImageReader imageReaderPreviewYUV;
 
     public CameraHelper(Activity hostActivity, AutoFitTextureView textureView){
@@ -102,6 +109,7 @@ public class CameraHelper {
         this.hostActivity = hostActivity;
         this.mStateCallback = new MyStateCallback();
         this.surfaceTextureListener = new MySurfaceTextureListener();
+        this.captureCallback = new MyCaptureCallback();
         initQrReader();
     }
 
@@ -158,21 +166,20 @@ public class CameraHelper {
                 Size largest = Collections.max(
                         Arrays.asList(map.getOutputSizes(ImageFormat.JPEG)),
                         new CompareSizesByArea());
-//                imageReaderPreviewYUV = ImageReader.newInstance(largest.getWidth(), largest.getHeight(),
-//                        ImageFormat.JPEG, /*maxImages*/2);
-//                imageReaderPreviewYUV.setOnImageAvailableListener(
-//                        new MyImageAvailableListener(), mBackgroundHandler);
 
 
                 previewSize = CameraHelper.chooseOptimalSize(map.getOutputSizes(SurfaceTexture.class),
                         width, height, largest);
 
-//                imageReaderPreviewYUV = ImageReader.newInstance(previewSize.getWidth(), previewSize.getHeight(),
-//                        ImageFormat.JPEG, /*maxImages*/2);
                 imageReaderPreviewYUV = ImageReader.newInstance(previewSize.getWidth(), previewSize.getHeight(),
-                        ImageFormat.YUV_420_888, /*maxImages*/2);
+                        ImageFormat.YUV_420_888, /*maxImages*/1);
                 imageReaderPreviewYUV.setOnImageAvailableListener(
-                        new MyImageAvailableListener(), mBackgroundHandler);
+                        new PreviewImageAvailableListener(), mBackgroundHandler);
+
+                imageReaderJPEG = ImageReader.newInstance(largest.getWidth(), largest.getHeight(),
+                        ImageFormat.JPEG, /*maxImages*/2);
+                imageReaderJPEG.setOnImageAvailableListener(
+                        new JPEGImageAvailableListener(), mBackgroundHandler);
 
                 // We fit the aspect ratio of TextureView to the size of preview we picked.
                 int orientation = App.getAppContext().getResources().getConfiguration().orientation;
@@ -237,10 +244,13 @@ public class CameraHelper {
             previewRequestBuilder
                     = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
             previewRequestBuilder.addTarget(surface);
-            previewRequestBuilder.addTarget(imageReaderPreviewYUV.getSurface());
 
-            // Here, we create a CameraCaptureSession for camera preview.
-            cameraDevice.createCaptureSession(Arrays.asList(surface, imageReaderPreviewYUV.getSurface()),
+            // todo handle addTarget only if QR reader is enabled
+//            previewRequestBuilder.addTarget(imageReaderPreviewYUV.getSurface());
+
+            // Here, we create a CameraCaptureSession for camera preview for all surfaces
+            cameraDevice.createCaptureSession(Arrays.asList(surface,
+                            imageReaderPreviewYUV.getSurface(), imageReaderJPEG.getSurface()),
                     new CameraCaptureSession.StateCallback() {
 
                         @Override
@@ -255,6 +265,8 @@ public class CameraHelper {
                                 // Auto focus should be continuous for camera preview.
                                 previewRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE,
                                         CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+
+                                // todo handle add Flash only if QR reader is disabled
                                 // Flash is automatically enabled when necessary.
 //                                previewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
 //                                        CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
@@ -262,7 +274,7 @@ public class CameraHelper {
                                 // Finally, we start displaying the camera preview.
                                 previewRequest = previewRequestBuilder.build();
                                 captureSession.setRepeatingRequest(previewRequest,
-                                        new MyCaptureCallback(), mBackgroundHandler);
+                                        captureCallback, mBackgroundHandler);
                             } catch (CameraAccessException e) {
                                 e.printStackTrace();
                             }
@@ -353,11 +365,140 @@ public class CameraHelper {
     }
 
     /**
-     * Listener implementations
+     * Taking photo
      * *********************************************************************************************
      */
 
-    private final class MyImageAvailableListener implements ImageReader.OnImageAvailableListener{
+    /**
+     * Initiate a still image capture.
+     */
+    public void takePicture() {
+        lockFocus();
+    }
+
+    /**
+     * Lock the focus as the first step for a still image capture.
+     */
+    private void lockFocus() {
+        try {
+            // Camera lock focus
+            previewRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER,
+                    CameraMetadata.CONTROL_AF_TRIGGER_START);
+
+            previewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+                    CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
+
+            // Tell captureCallback to wait for the lock.
+            state = CameraConstants.STATE_WAITING_LOCK;
+            captureSession.setRepeatingRequest(previewRequestBuilder.build(), captureCallback,
+                    mBackgroundHandler);
+        } catch (CameraAccessException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Run the precapture sequence for capturing a still image. This method should be called when we
+     * get a response in {@link #captureCallback} from {@link #lockFocus()}.
+     */
+    private void runPrecaptureSequence() {
+        try {
+            // Camera should trigger.
+            previewRequestBuilder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER,
+                    CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_START);
+
+            // Tell #captureCallback to wait for the precapture sequence to be set.
+            state = CameraConstants.STATE_WAITING_PRECAPTURE;
+            captureSession.capture(previewRequestBuilder.build(), captureCallback,
+                    mBackgroundHandler);
+        } catch (CameraAccessException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Capture a still picture. This method should be called when we get a response in
+     * {@link #captureCallback} from both {@link #lockFocus()}.
+     */
+    private void captureStillPicture() {
+        try {
+            if (null == hostActivity || null == cameraDevice) {
+                return;
+            }
+            // This is the CaptureRequest.Builder that we use to take a picture.
+            final CaptureRequest.Builder captureBuilder =
+                    cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
+            captureBuilder.addTarget(imageReaderJPEG.getSurface());
+
+            // Configure AE & AF modes
+            captureBuilder.set(CaptureRequest.CONTROL_AF_MODE,
+                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+            captureBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+                    CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
+
+            // Orientation
+            int rotation = hostActivity.getWindowManager().getDefaultDisplay().getRotation();
+            captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, CameraConstants.ORIENTATIONS.get(rotation));
+
+            CameraCaptureSession.CaptureCallback CaptureCallback
+                    = new CameraCaptureSession.CaptureCallback() {
+
+                @Override
+                public void onCaptureCompleted(CameraCaptureSession session, CaptureRequest request,
+                                               TotalCaptureResult result) {
+                    UIHelper.makeToast("File saved:");
+//                    Toast.makeText(getActivity(), "Saved: " + mFile, Toast.LENGTH_SHORT).show();
+                    unlockFocus();
+                }
+            };
+
+            captureSession.stopRepeating();
+            captureSession.capture(captureBuilder.build(), CaptureCallback, null);
+        } catch (CameraAccessException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Unlock the focus. This method should be called when still image capture sequence is finished.
+     */
+    private void unlockFocus() {
+        try {
+            // Reset the autofucos trigger
+            previewRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER,
+                    CameraMetadata.CONTROL_AF_TRIGGER_CANCEL);
+//            previewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+//                    CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
+            captureSession.capture(previewRequestBuilder.build(), captureCallback,
+                    mBackgroundHandler);
+
+            // After this, the camera will go back to the normal state of preview.
+            state = CameraConstants.STATE_PREVIEW;
+            captureSession.setRepeatingRequest(previewRequest, captureCallback,
+                    mBackgroundHandler);
+        } catch (CameraAccessException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Listener implementations
+     * *********************************************************************************************
+     */
+    private final class JPEGImageAvailableListener implements  ImageReader.OnImageAvailableListener{
+        @Override
+        public void onImageAvailable(ImageReader reader) {
+            // todo finish method
+            mBackgroundHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    Log.d(TAG, "save photo");
+                }
+            });
+        }
+    }
+
+    private final class PreviewImageAvailableListener implements ImageReader.OnImageAvailableListener{
 
         @Override
         public void onImageAvailable(final ImageReader reader) {
@@ -395,34 +536,60 @@ public class CameraHelper {
     }
 
     private final class MyCaptureCallback extends CameraCaptureSession.CaptureCallback{
-        @Override
-        public void onCaptureStarted(CameraCaptureSession session, CaptureRequest request, long timestamp, long frameNumber) {
-            super.onCaptureStarted(session, request, timestamp, frameNumber);
+
+        /**
+         * Process captures
+         * @param result
+         */
+        private void process(CaptureResult result){
+            switch (state){
+                case CameraConstants.STATE_PREVIEW:
+                    // Nothing to do, when in preview mode
+                    break;
+                case CameraConstants.STATE_WAITING_LOCK: {
+                    int afState = result.get(CaptureResult.CONTROL_AF_STATE);
+                    if (CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED == afState ||
+                            CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED == afState) {
+                        int aeState = result.get(CaptureResult.CONTROL_AE_STATE);
+                        if (aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED) {
+                            state = CameraConstants.STATE_WAITING_NON_PRECAPTURE;
+                            captureStillPicture();
+                        } else {
+                            runPrecaptureSequence();
+                        }
+                    }
+                    break;
+                }
+                case CameraConstants.STATE_WAITING_PRECAPTURE: {
+                    int aeState = result.get(CaptureResult.CONTROL_AE_STATE);
+                    if (CaptureResult.CONTROL_AE_STATE_PRECAPTURE == aeState) {
+                        state = CameraConstants.STATE_WAITING_NON_PRECAPTURE;
+                    } else if (CaptureRequest.CONTROL_AE_STATE_FLASH_REQUIRED == aeState) {
+                        state = CameraConstants.STATE_WAITING_NON_PRECAPTURE;
+                    }
+                    break;
+                }
+                case CameraConstants.STATE_WAITING_NON_PRECAPTURE: {
+                    int aeState = result.get(CaptureResult.CONTROL_AE_STATE);
+                    if (CaptureResult.CONTROL_AE_STATE_PRECAPTURE != aeState) {
+                        state = CameraConstants.STATE_PICTURE_TAKEN;
+                        captureStillPicture();
+                    }
+                    break;
+                }
+            }
         }
 
         @Override
-        public void onCaptureProgressed(CameraCaptureSession session, CaptureRequest request, CaptureResult partialResult) {
-            super.onCaptureProgressed(session, request, partialResult);
+        public void onCaptureProgressed(CameraCaptureSession session, CaptureRequest request,
+                                        CaptureResult partialResult) {
+            process(partialResult);
         }
 
         @Override
-        public void onCaptureCompleted(CameraCaptureSession session, CaptureRequest request, TotalCaptureResult result) {
-            super.onCaptureCompleted(session, request, result);
-        }
-
-        @Override
-        public void onCaptureFailed(CameraCaptureSession session, CaptureRequest request, CaptureFailure failure) {
-            super.onCaptureFailed(session, request, failure);
-        }
-
-        @Override
-        public void onCaptureSequenceCompleted(CameraCaptureSession session, int sequenceId, long frameNumber) {
-            super.onCaptureSequenceCompleted(session, sequenceId, frameNumber);
-        }
-
-        @Override
-        public void onCaptureSequenceAborted(CameraCaptureSession session, int sequenceId) {
-            super.onCaptureSequenceAborted(session, sequenceId);
+        public void onCaptureCompleted(CameraCaptureSession session, CaptureRequest request,
+                                       TotalCaptureResult result) {
+            process(result);
         }
     }
 
