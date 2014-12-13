@@ -24,11 +24,15 @@ import android.net.Uri;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.util.Log;
+import android.util.Range;
 import android.util.Size;
 import android.view.Surface;
 import android.view.TextureView;
 
 import com.tsulok.qrcodereader.App;
+import com.tsulok.qrcodereader.IQRFound;
+import com.tsulok.qrcodereader.ISettingsLoaded;
+import com.tsulok.qrcodereader.R;
 import com.tsulok.qrcodereader.utils.AutoFitTextureView;
 
 import net.sourceforge.zbar.Config;
@@ -36,11 +40,15 @@ import net.sourceforge.zbar.ImageScanner;
 import net.sourceforge.zbar.Symbol;
 import net.sourceforge.zbar.SymbolSet;
 
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Date;
 import java.util.List;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -53,6 +61,8 @@ public class CameraHelper {
     private CameraManager cameraManager;
     private Activity hostActivity;
     private AutoFitTextureView hostTextureView;
+    private boolean isPhotoModeEnabled = true;
+    private boolean isAutomaticMode = true;
 
     /**
      * QR Reader variables
@@ -62,6 +72,8 @@ public class CameraHelper {
     /**
      * Listeners
      */
+    private IQRFound qrFoundListener;
+    private ISettingsLoaded settingsLoadedListener;
     private MyStateCallback mStateCallback;
     private MySurfaceTextureListener surfaceTextureListener;
     private MyCaptureCallback captureCallback;
@@ -73,6 +85,13 @@ public class CameraHelper {
     private CaptureRequest previewRequest;
     private CameraCaptureSession captureSession;
     private boolean previousImageParsed = true;
+
+    /**
+     * Manual settings data
+     * #selectedExposureTime must be in nanoseconds!
+     */
+    private long selectedExposureTime;
+    private int selectedIso;
 
     /**
      * The current state of camera state for taking pictures.
@@ -107,14 +126,18 @@ public class CameraHelper {
     private ImageReader imageReaderJPEG;
     private ImageReader imageReaderPreviewYUV;
 
-    public CameraHelper(Activity hostActivity, AutoFitTextureView textureView){
+    public CameraHelper(Activity hostActivity, AutoFitTextureView textureView,
+                        IQRFound qrFoundListener, ISettingsLoaded settingsLoadedListener){
         this.cameraManager = (CameraManager) App.getAppContext().getSystemService(Context.CAMERA_SERVICE);
         this.hostTextureView = textureView;
         this.hostActivity = hostActivity;
         this.mStateCallback = new MyStateCallback();
         this.surfaceTextureListener = new MySurfaceTextureListener();
         this.captureCallback = new MyCaptureCallback();
+        this.qrFoundListener = qrFoundListener;
+        this.settingsLoadedListener = settingsLoadedListener;
         initQrReader();
+        hostActivity.setTitle(R.string.mode_photo);
     }
 
     public void handleOnResume(){
@@ -129,6 +152,86 @@ public class CameraHelper {
     public void handleOnPause(){
         stopBackgroundThread();
         closeCamera();
+    }
+
+    /**
+     * Switch to automatic mode with auto flash
+     */
+    public void switchToAutoMode(){
+        isAutomaticMode = true;
+        previewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+                CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
+        actualizeCaptureSession();
+    }
+
+    /**
+     * Switch to manual mode with previously saved data
+     */
+    public void switchToManualMode(){
+        isAutomaticMode = false;
+        previewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF);
+        previewRequestBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, selectedExposureTime);
+        previewRequestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, selectedIso);
+        actualizeCaptureSession();
+    }
+
+    /**
+     * Sets a new exposure time to the camera
+     * Should be converted first to nanoseconds
+     * @param expTime The human readable exposure time
+     */
+    public void setNewExposureTime(int expTime){
+        selectedExposureTime = expTime * CameraConstants.SEC_IN_NANO;
+        switchToManualMode();
+    }
+
+    /**
+     * Sets a new iso to the camera
+     * @param iso The new iso
+     */
+    public void setNewIso(int iso){
+        selectedIso = iso;
+        switchToManualMode();
+    }
+
+    /**
+     * Actualize the actual previewRequest to the capture session
+     */
+    private void actualizeCaptureSession(){
+        try {
+            captureSession.setRepeatingRequest(previewRequestBuilder.build(),
+                    captureCallback, backgroundHandler);
+        } catch (CameraAccessException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Changes the camera mode
+     * @param isPhotoModeEnabled True if photo mode, false if qr mode
+     */
+    public void changeMode(boolean isPhotoModeEnabled){
+        this.isPhotoModeEnabled = isPhotoModeEnabled;
+        handleMode();
+    }
+
+    /**
+     * Apply the appropriate camera mode
+     */
+    private void handleMode(){
+        if(!isPhotoModeEnabled){
+            previewRequestBuilder.addTarget(imageReaderPreviewYUV.getSurface());
+            // Disable auto flash mode
+            previewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+                    CaptureRequest.CONTROL_AE_MODE_ON);
+        } else {
+            previewRequestBuilder.removeTarget(imageReaderPreviewYUV.getSurface());
+            // Set auto flash mode
+            previewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+                    CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
+        }
+
+        actualizeCaptureSession();
     }
 
     /**
@@ -162,6 +265,9 @@ public class CameraHelper {
                         == CameraCharacteristics.LENS_FACING_FRONT) {
                     continue;
                 }
+
+                // Get iso &  exp possibilities
+                parseCamerManualSettings(characteristics);
 
                 StreamConfigurationMap map = characteristics.get(
                         CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
@@ -203,6 +309,37 @@ public class CameraHelper {
         } catch (NullPointerException e) {
             // Camera2API is used but not supported on the device.
             UIHelper.alert(hostActivity, "Error", "Device is not supported for Camera2API");
+        }
+    }
+
+    /**
+     * Parse camera settings
+     * @param characteristics of the actual camera
+     */
+    private void parseCamerManualSettings(CameraCharacteristics characteristics){
+        Range<Integer> isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
+        Range<Long> exposureRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
+
+        ArrayList<Integer> supportedIsoList = new ArrayList<>();
+        ArrayList<Integer> supportedExposureList = new ArrayList<>();
+
+        for (Integer validIsoRange : CameraConstants.validIsoRanges) {
+            if(isoRange.contains(validIsoRange)){
+                supportedIsoList.add(validIsoRange);
+            }
+        }
+
+        for (Integer validExposureTime : CameraConstants.validExposureTimes) {
+            long expTimeInNanos = CameraConstants.SEC_IN_NANO / validExposureTime;
+            if(exposureRange.contains(expTimeInNanos)){
+                supportedExposureList.add(validExposureTime);
+            }
+        }
+
+        if(settingsLoadedListener != null){
+            settingsLoadedListener.onIsoRangeLoaded(supportedIsoList, supportedIsoList.indexOf(100));
+            settingsLoadedListener.onExposureTimeRangeLoaded(
+                    supportedExposureList, supportedExposureList.indexOf(125));
         }
     }
 
@@ -250,16 +387,12 @@ public class CameraHelper {
             previewRequestBuilder.addTarget(surface);
 
             // todo handle addTarget only if QR reader is enabled
-            previewRequestBuilder.addTarget(imageReaderPreviewYUV.getSurface());
+//            previewRequestBuilder.addTarget(imageReaderPreviewYUV.getSurface());
 
             // Here, we create a CameraCaptureSession for camera preview for all surfaces
             cameraDevice.createCaptureSession(Arrays.asList(surface,
                             imageReaderPreviewYUV.getSurface(), imageReaderJPEG.getSurface()),
                       new CameraCaptureSession.StateCallback() {
-//            cameraDevice.createCaptureSession(Arrays.asList(surface, imageReaderJPEG.getSurface()),
-//                    new CameraCaptureSession.StateCallback() {
-//            cameraDevice.createCaptureSession(Arrays.asList(surface, imageReaderPreviewYUV.getSurface()),
-//                    new CameraCaptureSession.StateCallback() {
 
                         @Override
                         public void onConfigured(CameraCaptureSession cameraCaptureSession) {
@@ -273,11 +406,6 @@ public class CameraHelper {
                                 // Auto focus should be continuous for camera preview.
                                 previewRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE,
                                         CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-
-                                // Flash is automatically enabled when necessary.
-                                // todo disable when previews are handled
-                                previewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
-                                        CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
 
                                 // Finally, we start displaying the camera preview.
                                 previewRequest = previewRequestBuilder.build();
@@ -381,7 +509,11 @@ public class CameraHelper {
      * Initiate a still image capture.
      */
     public void takePicture() {
-        lockFocus();
+        if(isAutomaticMode){
+            lockFocus();
+        } else {
+            captureStillPicture();
+        }
     }
 
     /**
@@ -435,11 +567,22 @@ public class CameraHelper {
                     cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
             captureBuilder.addTarget(imageReaderJPEG.getSurface());
 
+
             // Configure AE & AF modes
-            captureBuilder.set(CaptureRequest.CONTROL_AF_MODE,
-                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-            captureBuilder.set(CaptureRequest.CONTROL_AE_MODE,
-                    CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
+            if(isAutomaticMode){
+                captureBuilder.set(CaptureRequest.CONTROL_AF_MODE,
+                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+                captureBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+                        CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
+
+            } else {
+                captureBuilder.set(CaptureRequest.CONTROL_AF_MODE,
+                        previewRequestBuilder.get(CaptureRequest.CONTROL_AF_MODE));
+                captureBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+                        previewRequestBuilder.get(CaptureRequest.CONTROL_AE_MODE));
+                captureBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, selectedExposureTime);
+                captureBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, selectedIso);
+            }
 
             // Orientation
             int rotation = hostActivity.getWindowManager().getDefaultDisplay().getRotation();
@@ -481,10 +624,14 @@ public class CameraHelper {
             // Reset the autofucos trigger
             previewRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER,
                     CameraMetadata.CONTROL_AF_TRIGGER_CANCEL);
-            previewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
-                    CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
+            // Enable auto flash
+            if(isAutomaticMode){
+                previewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+                        CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
+            } else {
+                switchToManualMode();
+            }
 
-//            captureSession.stopRepeating();
             captureSession.capture(previewRequestBuilder.build(), captureCallback,
                     backgroundHandler);
 
@@ -504,14 +651,35 @@ public class CameraHelper {
     private final class JPEGImageAvailableListener implements  ImageReader.OnImageAvailableListener{
         @Override
         public void onImageAvailable(final ImageReader reader) {
-            // todo finish method
+
             backgroundHandler.post(new Runnable() {
                 @Override
                 public void run() {
                     Image image = reader.acquireNextImage();
-                    Log.d(TAG, "Do photo save");
-                    image.close();
-                    Log.d(TAG, "Image closed");
+
+                    String filename = CameraConstants.dateFormat.format(new Date()) + ".jpg";
+
+                    ByteBuffer buffer = image.getPlanes()[0].getBuffer();
+                    byte[] bytes = new byte[buffer.remaining()];
+                    buffer.get(bytes);
+                    FileOutputStream output = null;
+                    try {
+                        output = new FileOutputStream(StorageHelper.getExternalStorageFile(filename));
+                        output.write(bytes);
+                    } catch (FileNotFoundException e) {
+                        e.printStackTrace();
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    } finally {
+                        image.close();
+                        if (null != output) {
+                            try {
+                                output.close();
+                            } catch (IOException e) {
+                                e.printStackTrace();
+                            }
+                        }
+                    }
                 }
             });
         }
@@ -525,11 +693,16 @@ public class CameraHelper {
             backgroundHandler.post(new Runnable() {
                 @Override
                 public void run() {
-//                    previousImageParsed = false;
                     Log.d(TAG, "Preview catched");
 
                     Image image = reader.acquireNextImage();
 
+                    if(!previousImageParsed){
+                        image.close();
+                        return;
+                    }
+
+                    previousImageParsed = false;
                     try {
                         ByteBuffer buffer = image.getPlanes()[0].getBuffer();
                         byte[] data = new byte[buffer.remaining()];
@@ -550,7 +723,9 @@ public class CameraHelper {
                             for (Symbol sym : syms) {
                                 String decoded = Uri.decode(sym.getData());
                                 Log.d(TAG, "QR data: " + decoded);
-                                UIHelper.makeToast(decoded);
+                                if(qrFoundListener != null){
+                                    qrFoundListener.onFound(decoded);
+                                }
                                 break;
                             }
                         }
@@ -559,6 +734,7 @@ public class CameraHelper {
                     } catch (Exception e){
                         Log.e(TAG, "Barcode scanner failed");
                     } finally {
+                        previousImageParsed = true;
                         image.close();
                     }
                 }

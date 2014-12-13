@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:layout_gravity="center"
+    android:gravity="center">
+
+    <ImageButton
+        android:id="@+id/prevValue"
+        android:layout_width="40dp"
+        android:layout_height="wrap_content"
+        style="@android:style/Widget.Material.Light.Button.Borderless"
+        android:src="@drawable/icon_navigation_prev"/>
+
+    <TextView
+        android:id="@+id/actualData"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"/>
+
+    <TextView
+        android:id="@+id/separator"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text=" / "/>
+
+    <TextView
+        android:id="@+id/maxValue"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="1000"/>
+
+    <ImageButton
+        android:id="@+id/nextValue"
+        android:layout_width="40dp"
+        android:layout_height="wrap_content"
+        style="@android:style/Widget.Material.Light.Button.Borderless"
+        android:src="@drawable/icon_navigation_next"/>
+
+</LinearLayout>

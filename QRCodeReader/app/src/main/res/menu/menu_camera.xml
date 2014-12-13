@@ -1,0 +1,14 @@
+<menu xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools" tools:context=".MainActivity">
+
+    <item android:id="@+id/action_mode_manual_switch"
+        android:title="@string/action_mode_manual"
+        app:showAsAction="always"
+        android:icon="@drawable/icon_manual"/>
+
+    <item android:id="@+id/action_mode_switch"
+        android:title="@string/action_mode_toggle"
+        app:showAsAction="always"
+        android:icon="@drawable/icon_qr"/>
+</menu>

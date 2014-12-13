@@ -2,8 +2,16 @@
 <resources>
 
     <string name="app_name">QRCodeReader</string>
-    <string name="hello_world">Hello world!</string>
-    <string name="action_settings">Settings</string>
 
-    <string name="title_main">MainFragment</string>
+    <string name="action_mode_toggle">Photo/QR mode</string>
+    <string name="action_mode_manual">Auto/Manual mode</string>
+
+    <string name="title_main">Camera</string>
+
+    <string name="qr_nodata">No data has been found</string>
+
+    <string name="mode_qr">QR mode</string>
+    <string name="mode_photo">Photo mode</string>
+    <string name="mode_automatic">Automatic mode</string>
+    <string name="mode_manual">Manual mode</string>
 </resources>
