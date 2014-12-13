@@ -13,12 +13,14 @@ import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CameraMetadata;
+import android.hardware.camera2.CaptureFailure;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.CaptureResult;
 import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
+import android.net.Uri;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.util.Log;
@@ -31,6 +33,8 @@ import com.tsulok.qrcodereader.utils.AutoFitTextureView;
 
 import net.sourceforge.zbar.Config;
 import net.sourceforge.zbar.ImageScanner;
+import net.sourceforge.zbar.Symbol;
+import net.sourceforge.zbar.SymbolSet;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -95,7 +99,7 @@ public class CameraHelper {
      * An additional thread & handler for running tasks that shouldn't block the UI.
      */
     private HandlerThread mBackgroundThread;
-    private Handler mBackgroundHandler;
+    private Handler backgroundHandler;
 
     /**
      * An {@link android.media.ImageReader} that handles still image capture.
@@ -174,12 +178,12 @@ public class CameraHelper {
                 imageReaderPreviewYUV = ImageReader.newInstance(previewSize.getWidth(), previewSize.getHeight(),
                         ImageFormat.YUV_420_888, /*maxImages*/1);
                 imageReaderPreviewYUV.setOnImageAvailableListener(
-                        new PreviewImageAvailableListener(), mBackgroundHandler);
+                        new PreviewImageAvailableListener(), backgroundHandler);
 
                 imageReaderJPEG = ImageReader.newInstance(largest.getWidth(), largest.getHeight(),
                         ImageFormat.JPEG, /*maxImages*/2);
                 imageReaderJPEG.setOnImageAvailableListener(
-                        new JPEGImageAvailableListener(), mBackgroundHandler);
+                        new JPEGImageAvailableListener(), backgroundHandler);
 
                 // We fit the aspect ratio of TextureView to the size of preview we picked.
                 int orientation = App.getAppContext().getResources().getConfiguration().orientation;
@@ -208,7 +212,7 @@ public class CameraHelper {
     private void startBackgroundThread() {
         mBackgroundThread = new HandlerThread("CameraBackground");
         mBackgroundThread.start();
-        mBackgroundHandler = new Handler(mBackgroundThread.getLooper());
+        backgroundHandler = new Handler(mBackgroundThread.getLooper());
     }
 
     /**
@@ -219,7 +223,7 @@ public class CameraHelper {
         try {
             mBackgroundThread.join();
             mBackgroundThread = null;
-            mBackgroundHandler = null;
+            backgroundHandler = null;
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
@@ -246,12 +250,16 @@ public class CameraHelper {
             previewRequestBuilder.addTarget(surface);
 
             // todo handle addTarget only if QR reader is enabled
-//            previewRequestBuilder.addTarget(imageReaderPreviewYUV.getSurface());
+            previewRequestBuilder.addTarget(imageReaderPreviewYUV.getSurface());
 
             // Here, we create a CameraCaptureSession for camera preview for all surfaces
             cameraDevice.createCaptureSession(Arrays.asList(surface,
                             imageReaderPreviewYUV.getSurface(), imageReaderJPEG.getSurface()),
-                    new CameraCaptureSession.StateCallback() {
+                      new CameraCaptureSession.StateCallback() {
+//            cameraDevice.createCaptureSession(Arrays.asList(surface, imageReaderJPEG.getSurface()),
+//                    new CameraCaptureSession.StateCallback() {
+//            cameraDevice.createCaptureSession(Arrays.asList(surface, imageReaderPreviewYUV.getSurface()),
+//                    new CameraCaptureSession.StateCallback() {
 
                         @Override
                         public void onConfigured(CameraCaptureSession cameraCaptureSession) {
@@ -266,15 +274,15 @@ public class CameraHelper {
                                 previewRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE,
                                         CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
 
-                                // todo handle add Flash only if QR reader is disabled
                                 // Flash is automatically enabled when necessary.
-//                                previewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
-//                                        CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
+                                // todo disable when previews are handled
+                                previewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+                                        CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
 
                                 // Finally, we start displaying the camera preview.
                                 previewRequest = previewRequestBuilder.build();
                                 captureSession.setRepeatingRequest(previewRequest,
-                                        captureCallback, mBackgroundHandler);
+                                        captureCallback, backgroundHandler);
                             } catch (CameraAccessException e) {
                                 e.printStackTrace();
                             }
@@ -331,7 +339,7 @@ public class CameraHelper {
             if (!cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
                 throw new RuntimeException("Time out waiting to lock camera opening.");
             }
-            cameraManager.openCamera(mCameraId, mStateCallback, mBackgroundHandler);
+            cameraManager.openCamera(mCameraId, mStateCallback, backgroundHandler);
         } catch (CameraAccessException e) {
             e.printStackTrace();
         } catch (InterruptedException e) {
@@ -385,13 +393,10 @@ public class CameraHelper {
             previewRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER,
                     CameraMetadata.CONTROL_AF_TRIGGER_START);
 
-            previewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
-                    CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
-
             // Tell captureCallback to wait for the lock.
             state = CameraConstants.STATE_WAITING_LOCK;
             captureSession.setRepeatingRequest(previewRequestBuilder.build(), captureCallback,
-                    mBackgroundHandler);
+                    backgroundHandler);
         } catch (CameraAccessException e) {
             e.printStackTrace();
         }
@@ -410,7 +415,7 @@ public class CameraHelper {
             // Tell #captureCallback to wait for the precapture sequence to be set.
             state = CameraConstants.STATE_WAITING_PRECAPTURE;
             captureSession.capture(previewRequestBuilder.build(), captureCallback,
-                    mBackgroundHandler);
+                    backgroundHandler);
         } catch (CameraAccessException e) {
             e.printStackTrace();
         }
@@ -446,8 +451,17 @@ public class CameraHelper {
                 @Override
                 public void onCaptureCompleted(CameraCaptureSession session, CaptureRequest request,
                                                TotalCaptureResult result) {
-                    UIHelper.makeToast("File saved:");
+                    UIHelper.makeToast("File saved at location...:");
+                    Log.d(TAG, "File saved at location...");
 //                    Toast.makeText(getActivity(), "Saved: " + mFile, Toast.LENGTH_SHORT).show();
+                    unlockFocus();
+                }
+
+                @Override
+                public void onCaptureFailed(CameraCaptureSession session, CaptureRequest request, CaptureFailure failure) {
+                    super.onCaptureFailed(session, request, failure);
+                    UIHelper.makeToast("File saved failed:");
+                    Log.d(TAG, "File saved failed");
                     unlockFocus();
                 }
             };
@@ -467,15 +481,17 @@ public class CameraHelper {
             // Reset the autofucos trigger
             previewRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER,
                     CameraMetadata.CONTROL_AF_TRIGGER_CANCEL);
-//            previewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
-//                    CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
+            previewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+                    CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
+
+//            captureSession.stopRepeating();
             captureSession.capture(previewRequestBuilder.build(), captureCallback,
-                    mBackgroundHandler);
+                    backgroundHandler);
 
             // After this, the camera will go back to the normal state of preview.
             state = CameraConstants.STATE_PREVIEW;
             captureSession.setRepeatingRequest(previewRequest, captureCallback,
-                    mBackgroundHandler);
+                    backgroundHandler);
         } catch (CameraAccessException e) {
             e.printStackTrace();
         }
@@ -487,12 +503,15 @@ public class CameraHelper {
      */
     private final class JPEGImageAvailableListener implements  ImageReader.OnImageAvailableListener{
         @Override
-        public void onImageAvailable(ImageReader reader) {
+        public void onImageAvailable(final ImageReader reader) {
             // todo finish method
-            mBackgroundHandler.post(new Runnable() {
+            backgroundHandler.post(new Runnable() {
                 @Override
                 public void run() {
-                    Log.d(TAG, "save photo");
+                    Image image = reader.acquireNextImage();
+                    Log.d(TAG, "Do photo save");
+                    image.close();
+                    Log.d(TAG, "Image closed");
                 }
             });
         }
@@ -502,15 +521,16 @@ public class CameraHelper {
 
         @Override
         public void onImageAvailable(final ImageReader reader) {
-            mBackgroundHandler.post(new Runnable() {
+
+            backgroundHandler.post(new Runnable() {
                 @Override
                 public void run() {
-                    if(previousImageParsed){
-                        previousImageParsed = false;
-                        Image image = reader.acquireNextImage();
+//                    previousImageParsed = false;
+                    Log.d(TAG, "Preview catched");
 
-                        Log.d(TAG, "Image found");
+                    Image image = reader.acquireNextImage();
 
+                    try {
                         ByteBuffer buffer = image.getPlanes()[0].getBuffer();
                         byte[] data = new byte[buffer.remaining()];
                         buffer.get(data);
@@ -525,10 +545,21 @@ public class CameraHelper {
                         barcode.setData(data);
                         int result = imageScanner.scanImage(barcode);
 
-                        Log.i(TAG, "Result: " + result);
+                        if (result != 0) {
+                            SymbolSet syms = imageScanner.getResults();
+                            for (Symbol sym : syms) {
+                                String decoded = Uri.decode(sym.getData());
+                                Log.d(TAG, "QR data: " + decoded);
+                                UIHelper.makeToast(decoded);
+                                break;
+                            }
+                        }
 
-                        reader.close();
-                        previousImageParsed = true;
+                        Log.i(TAG, "Result: " + result);
+                    } catch (Exception e){
+                        Log.e(TAG, "Barcode scanner failed");
+                    } finally {
+                        image.close();
                     }
                 }
             });
